@@ -1,0 +1,47 @@
+{
+  "id": "clawdbot-wecom",
+  "name": "@mijia-life/clawdbot-wecom",
+  "version": "0.1.0",
+  "description": "WeCom (企业微信) channel plugin for Clawdbot (internal apps).",
+  "extensions": ["./src/index.js"],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "corpId": {
+        "type": "string",
+        "description": "企业微信 Corp ID"
+      },
+      "corpSecret": {
+        "type": "string",
+        "description": "企业微信 Corp Secret"
+      },
+      "agentId": {
+        "type": "number",
+        "description": "企业微信 Agent ID"
+      },
+      "callbackToken": {
+        "type": "string",
+        "description": "回调 Token"
+      },
+      "callbackAesKey": {
+        "type": "string",
+        "description": "回调 AES Key"
+      },
+      "webhookPath": {
+        "type": "string",
+        "description": "Webhook 路径",
+        "default": "/wecom/callback"
+      }
+    }
+  },
+  "channel": {
+    "id": "wecom",
+    "label": "WeCom",
+    "selectionLabel": "WeCom (企业微信自建应用)",
+    "docsPath": "/channels/wecom",
+    "docsLabel": "wecom",
+    "blurb": "Enterprise WeChat internal app via callback + send API.",
+    "order": 80,
+    "aliases": ["wework", "qiwei", "wxwork"]
+  }
+}
