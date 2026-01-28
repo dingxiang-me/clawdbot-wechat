@@ -3,9 +3,11 @@ import { XMLParser, XMLBuilder } from "fast-xml-parser";
 import { normalizePluginHttpPath } from "clawdbot/plugin-sdk";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { writeFile, unlink, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { writeFile, unlink, mkdir, appendFile } from "node:fs/promises";
+import { existsSync, appendFileSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join, dirname } from "node:path";
+import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const xmlParser = new XMLParser({
@@ -411,6 +413,60 @@ async function sendWecomImage({ corpId, corpSecret, agentId, toUser, mediaId }) 
   });
 }
 
+// 发送视频消息（带限流）
+async function sendWecomVideo({ corpId, corpSecret, agentId, toUser, mediaId, title, description }) {
+  return apiLimiter.execute(async () => {
+    const accessToken = await getWecomAccessToken({ corpId, corpSecret });
+    const sendUrl = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(accessToken)}`;
+    const body = {
+      touser: toUser,
+      msgtype: "video",
+      agentid: agentId,
+      video: {
+        media_id: mediaId,
+        ...(title ? { title } : {}),
+        ...(description ? { description } : {}),
+      },
+      safe: 0,
+    };
+    const sendRes = await fetch(sendUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const sendJson = await sendRes.json();
+    if (sendJson?.errcode !== 0) {
+      throw new Error(`WeCom video send failed: ${JSON.stringify(sendJson)}`);
+    }
+    return sendJson;
+  });
+}
+
+// 发送文件消息（带限流）
+async function sendWecomFile({ corpId, corpSecret, agentId, toUser, mediaId }) {
+  return apiLimiter.execute(async () => {
+    const accessToken = await getWecomAccessToken({ corpId, corpSecret });
+    const sendUrl = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(accessToken)}`;
+    const body = {
+      touser: toUser,
+      msgtype: "file",
+      agentid: agentId,
+      file: { media_id: mediaId },
+      safe: 0,
+    };
+    const sendRes = await fetch(sendUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const sendJson = await sendRes.json();
+    if (sendJson?.errcode !== 0) {
+      throw new Error(`WeCom file send failed: ${JSON.stringify(sendJson)}`);
+    }
+    return sendJson;
+  });
+}
+
 // 从 URL 下载媒体文件
 async function fetchMediaFromUrl(url) {
   const res = await fetch(url);
@@ -502,6 +558,82 @@ const WecomChannelPlugin = {
 
 // 存储 runtime 引用以便在消息处理中使用
 let gatewayRuntime = null;
+
+// 存储 gateway broadcast 上下文，用于向 Chat UI 广播消息
+let gatewayBroadcastCtx = null;
+
+// 写入消息到 session transcript 文件，使 Chat UI 可以显示
+async function writeToTranscript({ sessionKey, role, text, logger }) {
+  try {
+    const stateDir = process.env.CLAWDBOT_STATE_DIR || join(homedir(), ".clawdbot");
+    const sessionsDir = join(stateDir, "agents", "main", "sessions");
+    const sessionsJsonPath = join(sessionsDir, "sessions.json");
+
+    // 读取 sessions.json 获取 sessionId
+    if (!existsSync(sessionsJsonPath)) {
+      logger?.warn?.("wecom: sessions.json not found");
+      return;
+    }
+
+    const { readFileSync } = await import("node:fs");
+    const sessionsData = JSON.parse(readFileSync(sessionsJsonPath, "utf8"));
+    const sessionEntry = sessionsData[sessionKey] || sessionsData[sessionKey.toLowerCase()];
+
+    if (!sessionEntry?.sessionId) {
+      logger?.warn?.(`wecom: session entry not found for ${sessionKey}`);
+      return;
+    }
+
+    const transcriptPath = sessionEntry.sessionFile || join(sessionsDir, `${sessionEntry.sessionId}.jsonl`);
+
+    const now = Date.now();
+    const messageId = randomUUID().slice(0, 8);
+
+    const transcriptEntry = {
+      type: "message",
+      id: messageId,
+      timestamp: new Date(now).toISOString(),
+      message: {
+        role,
+        content: [{ type: "text", text }],
+        timestamp: now,
+        stopReason: role === "assistant" ? "end_turn" : undefined,
+        usage: role === "assistant" ? { input: 0, output: 0, totalTokens: 0 } : undefined,
+      },
+    };
+
+    appendFileSync(transcriptPath, `${JSON.stringify(transcriptEntry)}\n`, "utf-8");
+    logger?.info?.(`wecom: wrote ${role} message to transcript`);
+  } catch (err) {
+    logger?.warn?.(`wecom: failed to write transcript: ${err.message}`);
+  }
+}
+
+// 广播消息到 Chat UI
+function broadcastToChatUI({ sessionKey, role, text, runId, state }) {
+  if (!gatewayBroadcastCtx) {
+    return; // 没有 broadcast 上下文，跳过
+  }
+
+  try {
+    const chatPayload = {
+      runId: runId || `wecom-${Date.now()}`,
+      sessionKey,
+      seq: 0,
+      state: state || "final",
+      message: {
+        role: role || "user",
+        content: [{ type: "text", text: text || "" }],
+        timestamp: Date.now(),
+      },
+    };
+
+    gatewayBroadcastCtx.broadcast("chat", chatPayload);
+    gatewayBroadcastCtx.bridgeSendToSession(sessionKey, "chat", chatPayload);
+  } catch (err) {
+    // 忽略广播错误，不影响主流程
+  }
+}
 
 // 多账户配置存储
 const wecomAccounts = new Map(); // key: accountId, value: config
@@ -645,6 +777,42 @@ export default function register(api) {
 
   api.registerChannel({ plugin: WecomChannelPlugin });
 
+  // 注册一个 gateway 方法来获取 broadcast 上下文
+  // 这个方法会在插件加载时被调用，用于捕获 broadcast 上下文
+  api.registerGatewayMethod("wecom.init", async (ctx, nodeId, params) => {
+    gatewayBroadcastCtx = ctx;
+    api.logger.info?.("wecom: gateway broadcast context captured");
+    return { ok: true };
+  });
+
+  // 注册一个 gateway 方法用于广播消息到 Chat UI
+  api.registerGatewayMethod("wecom.broadcast", async (ctx, nodeId, params) => {
+    const { sessionKey, runId, message, state } = params || {};
+    if (!sessionKey || !message) {
+      return { ok: false, error: { message: "missing sessionKey or message" } };
+    }
+
+    const chatPayload = {
+      runId: runId || `wecom-${Date.now()}`,
+      sessionKey,
+      seq: 0,
+      state: state || "final",
+      message: {
+        role: message.role || "user",
+        content: [{ type: "text", text: message.text || "" }],
+        timestamp: Date.now(),
+      },
+    };
+
+    ctx.broadcast("chat", chatPayload);
+    ctx.bridgeSendToSession(sessionKey, "chat", chatPayload);
+
+    // 保存 broadcast 上下文供后续使用
+    gatewayBroadcastCtx = ctx;
+
+    return { ok: true };
+  });
+
   const webhookPath = cfg?.webhookPath || "/wecom/callback";
   const normalizedPath = normalizePluginHttpPath(webhookPath, "/wecom/callback") ?? "/wecom/callback";
 
@@ -751,6 +919,40 @@ export default function register(api) {
         processInboundMessage({ api, fromUser, mediaId: msgObj.MediaId, msgType: "voice", recognition: msgObj.Recognition, chatId, isGroupChat }).catch((err) => {
           api.logger.error?.(`wecom: async voice processing failed: ${err.message}`);
         });
+      } else if (msgType === "video" && msgObj?.MediaId) {
+        processInboundMessage({
+          api, fromUser,
+          mediaId: msgObj.MediaId,
+          msgType: "video",
+          thumbMediaId: msgObj.ThumbMediaId,
+          chatId, isGroupChat
+        }).catch((err) => {
+          api.logger.error?.(`wecom: async video processing failed: ${err.message}`);
+        });
+      } else if (msgType === "file" && msgObj?.MediaId) {
+        processInboundMessage({
+          api, fromUser,
+          mediaId: msgObj.MediaId,
+          msgType: "file",
+          fileName: msgObj.FileName,
+          fileSize: msgObj.FileSize,
+          chatId, isGroupChat
+        }).catch((err) => {
+          api.logger.error?.(`wecom: async file processing failed: ${err.message}`);
+        });
+      } else if (msgType === "link") {
+        // 链接分享消息
+        processInboundMessage({
+          api, fromUser,
+          msgType: "link",
+          linkTitle: msgObj.Title,
+          linkDescription: msgObj.Description,
+          linkUrl: msgObj.Url,
+          linkPicUrl: msgObj.PicUrl,
+          chatId, isGroupChat
+        }).catch((err) => {
+          api.logger.error?.(`wecom: async link processing failed: ${err.message}`);
+        });
       } else {
         api.logger.info?.(`wecom: ignoring unsupported message type=${msgType}`);
       }
@@ -852,9 +1054,11 @@ const COMMANDS = {
   "/status": handleStatusCommand,
 };
 
-// 异步处理入站消息
-async function processInboundMessage({ api, fromUser, content, msgType, mediaId, picUrl, recognition, chatId, isGroupChat }) {
+// 异步处理入站消息 - 使用 gateway 内部 agent runtime API
+async function processInboundMessage({ api, fromUser, content, msgType, mediaId, picUrl, recognition, thumbMediaId, fileName, fileSize, linkTitle, linkDescription, linkUrl, linkPicUrl, chatId, isGroupChat }) {
   const config = getWecomConfig(api);
+  const cfg = api.config;
+  const runtime = api.runtime;
 
   if (!config?.corpId || !config?.corpSecret || !config?.agentId) {
     api.logger.warn?.("wecom: not configured (check channels.wecom in clawdbot.json)");
@@ -865,7 +1069,8 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
 
   try {
     // 会话ID：群聊使用 wecom:group:chatId，私聊使用 wecom:userId
-    const sessionId = isGroupChat ? `wecom:group:${chatId}` : `wecom:${fromUser}`;
+    // 注意：sessionKey 需要统一为小写，与 resolveAgentRoute 保持一致
+    const sessionId = isGroupChat ? `wecom:group:${chatId}`.toLowerCase() : `wecom:${fromUser}`.toLowerCase();
     api.logger.info?.(`wecom: processing ${msgType} message for session ${sessionId}${isGroupChat ? " (group)" : ""}`);
 
     // 命令检测（仅对文本消息）
@@ -930,18 +1135,60 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
       }
     }
 
+    // 处理视频消息
+    if (msgType === "video" && mediaId) {
+      api.logger.info?.(`wecom: received video message mediaId=${mediaId}`);
+      try {
+        const { buffer, contentType } = await downloadWecomMedia({ corpId, corpSecret, mediaId });
+        const tempDir = join(tmpdir(), "clawdbot-wecom");
+        await mkdir(tempDir, { recursive: true });
+        const videoTempPath = join(tempDir, `video-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
+        await writeFile(videoTempPath, buffer);
+        api.logger.info?.(`wecom: saved video to ${videoTempPath}, size=${buffer.length} bytes`);
+        messageText = `[用户发送了一个视频文件，已保存到: ${videoTempPath}]\n\n请告知用户您已收到视频。`;
+      } catch (downloadErr) {
+        api.logger.warn?.(`wecom: failed to download video: ${downloadErr.message}`);
+        messageText = "[用户发送了一个视频，但下载失败]\n\n请告诉用户视频处理暂时不可用。";
+      }
+    }
+
+    // 处理文件消息
+    if (msgType === "file" && mediaId) {
+      api.logger.info?.(`wecom: received file message mediaId=${mediaId}, fileName=${fileName}, size=${fileSize}`);
+      try {
+        const { buffer, contentType } = await downloadWecomMedia({ corpId, corpSecret, mediaId });
+        const ext = fileName ? fileName.split('.').pop() : 'bin';
+        const safeFileName = fileName || `file-${Date.now()}.${ext}`;
+        const tempDir = join(tmpdir(), "clawdbot-wecom");
+        await mkdir(tempDir, { recursive: true });
+        const fileTempPath = join(tempDir, `${Date.now()}-${safeFileName}`);
+        await writeFile(fileTempPath, buffer);
+        api.logger.info?.(`wecom: saved file to ${fileTempPath}, size=${buffer.length} bytes`);
+
+        const readableTypes = ['.txt', '.md', '.json', '.xml', '.csv', '.log', '.pdf'];
+        const isReadable = readableTypes.some(t => safeFileName.toLowerCase().endsWith(t));
+
+        if (isReadable) {
+          messageText = `[用户发送了一个文件: ${safeFileName}，已保存到: ${fileTempPath}]\n\n请使用 Read 工具查看这个文件的内容。`;
+        } else {
+          messageText = `[用户发送了一个文件: ${safeFileName}，大小: ${fileSize || buffer.length} 字节，已保存到: ${fileTempPath}]\n\n请告知用户您已收到文件。`;
+        }
+      } catch (downloadErr) {
+        api.logger.warn?.(`wecom: failed to download file: ${downloadErr.message}`);
+        messageText = `[用户发送了一个文件${fileName ? `: ${fileName}` : ''}，但下载失败]\n\n请告诉用户文件处理暂时不可用。`;
+      }
+    }
+
+    // 处理链接分享消息
+    if (msgType === "link") {
+      api.logger.info?.(`wecom: received link message title=${linkTitle}, url=${linkUrl}`);
+      messageText = `[用户分享了一个链接]\n标题: ${linkTitle || '(无标题)'}\n描述: ${linkDescription || '(无描述)'}\n链接: ${linkUrl || '(无链接)'}\n\n请根据链接内容回复用户。如需要，可以使用 WebFetch 工具获取链接内容。`;
+    }
+
     if (!messageText) {
       api.logger.warn?.("wecom: empty message content");
       return;
     }
-
-    // 发送"正在处理"提示，缓解用户等待焦虑
-    await sendWecomTextSingle({
-      corpId, corpSecret, agentId, toUser: fromUser,
-      text: "⏳ 收到您的消息，正在处理中，请稍候..."
-    });
-
-    api.logger.info?.(`wecom: calling agent for session ${sessionId}`);
 
     // 如果有图片，保存到临时文件供 AI 读取
     let imageTempPath = null;
@@ -962,20 +1209,156 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
       }
     }
 
-    // 使用 clawdbot agent CLI 调用 AI 代理
-    let stdout;
+    // 获取路由信息
+    const route = runtime.channel.routing.resolveAgentRoute({
+      cfg,
+      sessionKey: sessionId,
+      channel: "wecom",
+      accountId: config.accountId || "default",
+    });
+
+    // 获取 storePath
+    const storePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: route.agentId,
+    });
+
+    // 格式化消息体
+    const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
+    const body = runtime.channel.reply.formatInboundEnvelope({
+      channel: "WeCom",
+      from: fromUser,
+      timestamp: Date.now(),
+      body: messageText,
+      chatType: isGroupChat ? "group" : "direct",
+      sender: {
+        name: fromUser,
+        id: fromUser,
+      },
+      ...envelopeOptions,
+    });
+
+    // 构建 Session 上下文对象
+    const ctxPayload = {
+      Body: body,
+      RawBody: content || "",
+      From: isGroupChat ? `wecom:group:${chatId}` : `wecom:${fromUser}`,
+      To: `wecom:${fromUser}`,
+      SessionKey: sessionId,
+      AccountId: config.accountId || "default",
+      ChatType: isGroupChat ? "group" : "direct",
+      ConversationLabel: fromUser,
+      SenderName: fromUser,
+      SenderId: fromUser,
+      Provider: "wecom",
+      Surface: "wecom",
+      MessageSid: `wecom-${Date.now()}`,
+      Timestamp: Date.now(),
+      OriginatingChannel: "wecom",
+      OriginatingTo: `wecom:${fromUser}`,
+    };
+
+    // 注册会话到 Sessions UI
+    await runtime.channel.session.recordInboundSession({
+      storePath,
+      sessionKey: sessionId,
+      ctx: ctxPayload,
+      updateLastRoute: !isGroupChat ? {
+        sessionKey: sessionId,
+        channel: "wecom",
+        to: fromUser,
+        accountId: config.accountId || "default",
+      } : undefined,
+      onRecordError: (err) => {
+        api.logger.warn?.(`wecom: failed to record session: ${err}`);
+      },
+    });
+    api.logger.info?.(`wecom: session registered for ${sessionId}`);
+
+    // 记录渠道活动
+    runtime.channel.activity.record({
+      channel: "wecom",
+      accountId: config.accountId || "default",
+      direction: "inbound",
+    });
+
+    // 写入用户消息到 transcript 文件（使 Chat UI 可以显示历史）
+    await writeToTranscript({
+      sessionKey: sessionId,
+      role: "user",
+      text: messageText,
+      logger: api.logger,
+    });
+
+    // 广播用户消息到 Chat UI
+    const inboundRunId = `wecom-inbound-${Date.now()}`;
+    broadcastToChatUI({
+      sessionKey: sessionId,
+      role: "user",
+      text: messageText,
+      runId: inboundRunId,
+      state: "final",
+    });
+
+    api.logger.info?.(`wecom: dispatching message via agent runtime for session ${sessionId}`);
+
+    // 使用 gateway 内部 agent runtime API 调用 AI
+    // 对标 Telegram 的 dispatchReplyWithBufferedBlockDispatcher
+    const chunkMode = runtime.channel.text.resolveChunkMode(cfg, "wecom", config.accountId || "default");
+    const tableMode = runtime.channel.text.resolveMarkdownTableMode({
+      cfg,
+      channel: "wecom",
+      accountId: config.accountId || "default",
+    });
+
     try {
-      const result = await execFileAsync("clawdbot", [
-        "agent",
-        "--message", messageText,
-        "--session-id", sessionId,
-        "--json",
-        "--timeout", "120",
-      ], {
-        timeout: 130000, // 130秒超时
-        maxBuffer: 10 * 1024 * 1024, // 10MB
+      const outboundRunId = `wecom-outbound-${Date.now()}`;
+      await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx: ctxPayload,
+        cfg,
+        dispatcherOptions: {
+          deliver: async (payload, info) => {
+            // 发送回复到企业微信
+            if (payload.text) {
+              api.logger.info?.(`wecom: delivering ${info.kind} reply, length=${payload.text.length}`);
+              // 应用 Markdown 转换
+              const formattedReply = markdownToWecomText(payload.text);
+              await sendWecomText({
+                corpId,
+                corpSecret,
+                agentId,
+                toUser: fromUser,
+                text: formattedReply,
+                logger: api.logger,
+              });
+              api.logger.info?.(`wecom: sent AI reply to ${fromUser}: ${formattedReply.slice(0, 50)}...`);
+
+              // 写入 AI 回复到 transcript 文件（使 Chat UI 可以显示历史）
+              await writeToTranscript({
+                sessionKey: sessionId,
+                role: "assistant",
+                text: payload.text,
+                logger: api.logger,
+              });
+
+              // 广播 AI 回复到 Chat UI
+              broadcastToChatUI({
+                sessionKey: sessionId,
+                role: "assistant",
+                text: payload.text,
+                runId: outboundRunId,
+                state: info.kind === "final" ? "final" : "streaming",
+              });
+            }
+          },
+          onError: (err, info) => {
+            api.logger.error?.(`wecom: ${info.kind} reply failed: ${String(err)}`);
+          },
+        },
+        replyOptions: {
+          // 禁用流式响应，因为企业微信不支持编辑消息
+          disableBlockStreaming: true,
+        },
       });
-      stdout = result.stdout;
     } finally {
       // 清理临时图片文件
       if (imageTempPath) {
@@ -983,51 +1366,6 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
       }
     }
 
-    // 解析 JSON 输出
-    let result;
-    try {
-      result = JSON.parse(stdout);
-      api.logger.info?.(`wecom: agent stdout length=${stdout.length}, parsed OK`);
-    } catch (parseErr) {
-      api.logger.warn?.(`wecom: failed to parse agent response as JSON: ${stdout.slice(0, 200)}`);
-      // 如果不是 JSON，直接使用输出作为回复
-      result = { text: stdout.trim() };
-    }
-
-    // 从 clawdbot agent --json 输出中提取回复文本
-    // 格式: { result: { payloads: [{ text: "..." }] } }
-    let replyText = "";
-    if (result?.result?.payloads && Array.isArray(result.result.payloads)) {
-      api.logger.info?.(`wecom: found ${result.result.payloads.length} payloads`);
-      replyText = result.result.payloads
-        .map(p => p.text)
-        .filter(Boolean)
-        .join("\n\n");
-    } else if (result?.text) {
-      replyText = result.text;
-    } else if (result?.content) {
-      replyText = result.content;
-    } else if (typeof result === "string") {
-      replyText = result;
-    }
-
-    if (replyText) {
-      api.logger.info?.(`wecom: raw replyText length=${replyText.length}`);
-      // 应用 Markdown 转换
-      const formattedReply = markdownToWecomText(replyText);
-      api.logger.info?.(`wecom: formatted reply length=${formattedReply.length}`);
-      await sendWecomText({
-        corpId,
-        corpSecret,
-        agentId,
-        toUser: fromUser,
-        text: formattedReply,
-        logger: api.logger,
-      });
-      api.logger.info?.(`wecom: sent AI reply to ${fromUser}: ${formattedReply.slice(0, 50)}...`);
-    } else {
-      api.logger.warn?.("wecom: agent returned empty response");
-    }
   } catch (err) {
     api.logger.error?.(`wecom: failed to process message: ${err.message}`);
     api.logger.error?.(`wecom: stack trace: ${err.stack}`);

@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-01-29
+
+### Added
+
+#### 媒体消息扩展
+- **视频消息接收**：支持接收用户发送的视频，自动下载保存到临时目录
+- **视频消息发送**：新增 `sendWecomVideo()` 函数，支持发送视频到企业微信
+- **文件消息接收**：支持接收用户发送的文件/文档，自动识别可读类型（.txt, .md, .json, .pdf 等）
+- **文件消息发送**：新增 `sendWecomFile()` 函数，支持发送文件到企业微信
+- **链接分享消息**：支持接收用户分享的链接，提取标题、描述和 URL
+
+#### Chat UI 集成
+- **消息同步到 Transcript**：用户消息和 AI 回复写入 session transcript 文件
+- **实时广播**：通过 gateway broadcast 实时推送消息到 Chat UI
+- **Gateway 方法**：新增 `wecom.init` 和 `wecom.broadcast` 方法
+
+### Changed
+- `processInboundMessage()` 函数签名扩展，支持更多消息类型参数
+- HTTP 路由处理器新增 video、file、link 类型消息分发
+
 ## [0.3.1] - 2026-01-28
 
 ### Fixed
