@@ -187,8 +187,13 @@ function markdownToWecomText(markdown) {
   return text.trim();
 }
 
-// 企业微信文本消息限制
-const WECOM_TEXT_LIMIT = 2048;
+// 企业微信文本消息限制 (2048 字节，中文约 680 字)
+const WECOM_TEXT_BYTE_LIMIT = 2000; // 留点余量
+
+// 计算字符串的 UTF-8 字节长度
+function getByteLength(str) {
+  return Buffer.byteLength(str, 'utf8');
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -247,43 +252,62 @@ const apiLimiter = new RateLimiter({ maxConcurrent: 3, minInterval: 200 });
 // 消息处理限流器（最多5并发）
 const messageProcessLimiter = new RateLimiter({ maxConcurrent: 5, minInterval: 0 });
 
-// 消息分段函数，优先在自然断点处分割
-function splitWecomText(text, limit = WECOM_TEXT_LIMIT) {
-  if (text.length <= limit) return [text];
+// 消息分段函数，按字节限制分割（企业微信限制 2048 字节）
+function splitWecomText(text, byteLimit = WECOM_TEXT_BYTE_LIMIT) {
+  if (getByteLength(text) <= byteLimit) return [text];
 
   const chunks = [];
   let remaining = text;
 
   while (remaining.length > 0) {
-    if (remaining.length <= limit) {
+    if (getByteLength(remaining) <= byteLimit) {
       chunks.push(remaining);
       break;
     }
 
+    // 二分查找合适的分割点（按字节）
+    let low = 1;
+    let high = remaining.length;
+
+    while (low < high) {
+      const mid = Math.floor((low + high + 1) / 2);
+      if (getByteLength(remaining.slice(0, mid)) <= byteLimit) {
+        low = mid;
+      } else {
+        high = mid - 1;
+      }
+    }
+    let splitIndex = low;
+
+    // 尝试在自然断点处分割（往前找 200 字符范围内）
+    const searchStart = Math.max(0, splitIndex - 200);
+    const searchText = remaining.slice(searchStart, splitIndex);
+
     // 优先在段落处分割
-    let splitIndex = remaining.lastIndexOf("\n\n", limit);
-    // 其次在换行处分割
-    if (splitIndex < limit * 0.3) {
-      splitIndex = remaining.lastIndexOf("\n", limit);
+    let naturalBreak = searchText.lastIndexOf("\n\n");
+    if (naturalBreak === -1) {
+      // 其次在换行处
+      naturalBreak = searchText.lastIndexOf("\n");
     }
-    // 再次在句号处分割
-    if (splitIndex < limit * 0.3) {
-      splitIndex = remaining.lastIndexOf("。", limit);
+    if (naturalBreak === -1) {
+      // 再次在句号处
+      naturalBreak = searchText.lastIndexOf("。");
+      if (naturalBreak !== -1) naturalBreak += 1; // 包含句号
     }
-    // 最后在空格处分割
-    if (splitIndex < limit * 0.3) {
-      splitIndex = remaining.lastIndexOf(" ", limit);
-    }
-    // 如果都找不到，强制在限制处分割
-    if (splitIndex < limit * 0.2) {
-      splitIndex = limit;
+    if (naturalBreak !== -1 && naturalBreak > 0) {
+      splitIndex = searchStart + naturalBreak;
     }
 
-    chunks.push(remaining.slice(0, splitIndex));
-    remaining = remaining.slice(splitIndex).trimStart();
+    // 确保至少分割一些内容
+    if (splitIndex <= 0) {
+      splitIndex = Math.min(remaining.length, Math.floor(byteLimit / 3));
+    }
+
+    chunks.push(remaining.slice(0, splitIndex).trim());
+    remaining = remaining.slice(splitIndex).trim();
   }
 
-  return chunks;
+  return chunks.filter(c => c.length > 0);
 }
 
 // 发送单条文本消息（内部函数，带限流）
@@ -313,14 +337,17 @@ async function sendWecomTextSingle({ corpId, corpSecret, agentId, toUser, text }
 }
 
 // 发送文本消息（支持自动分段）
-async function sendWecomText({ corpId, corpSecret, agentId, toUser, text }) {
+async function sendWecomText({ corpId, corpSecret, agentId, toUser, text, logger }) {
   const chunks = splitWecomText(text);
 
+  logger?.info?.(`wecom: splitting message into ${chunks.length} chunks, total bytes=${getByteLength(text)}`);
+
   for (let i = 0; i < chunks.length; i++) {
+    logger?.info?.(`wecom: sending chunk ${i + 1}/${chunks.length}, bytes=${getByteLength(chunks[i])}`);
     await sendWecomTextSingle({ corpId, corpSecret, agentId, toUser, text: chunks[i] });
     // 分段发送时添加间隔，避免触发限流
     if (i < chunks.length - 1) {
-      await sleep(100);
+      await sleep(300);
     }
   }
 }
@@ -381,6 +408,7 @@ async function sendWecomImage({ corpId, corpSecret, agentId, toUser, mediaId }) 
       throw new Error(`WeCom image send failed: ${JSON.stringify(sendJson)}`);
     }
     return sendJson;
+  });
 }
 
 // 从 URL 下载媒体文件
@@ -480,6 +508,7 @@ const wecomAccounts = new Map(); // key: accountId, value: config
 let defaultAccountId = "default";
 
 // 获取 wecom 配置（支持多账户）
+// 优先级: channels.wecom > env.vars > 进程环境变量
 function getWecomConfig(api, accountId = null) {
   const targetAccountId = accountId || defaultAccountId;
 
@@ -490,10 +519,60 @@ function getWecomConfig(api, accountId = null) {
 
   const cfg = api?.config ?? gatewayRuntime?.config;
 
-  // 尝试从 env.vars 读取配置（支持多账户格式）
-  const envVars = cfg?.env?.vars ?? {};
+  // 1. 优先从 channels.wecom 读取配置
+  const channelConfig = cfg?.channels?.wecom;
+  if (channelConfig && targetAccountId === "default") {
+    const corpId = channelConfig.corpId;
+    const corpSecret = channelConfig.corpSecret;
+    const agentId = channelConfig.agentId;
+    const callbackToken = channelConfig.callbackToken;
+    const callbackAesKey = channelConfig.callbackAesKey;
+    const webhookPath = channelConfig.webhookPath || "/wecom/callback";
 
-  // 检查是否有账户特定的配置 (WECOM_<ACCOUNT>_CORP_ID 格式)
+    if (corpId && corpSecret && agentId) {
+      const config = {
+        accountId: targetAccountId,
+        corpId,
+        corpSecret,
+        agentId: asNumber(agentId),
+        callbackToken,
+        callbackAesKey,
+        webhookPath,
+        enabled: channelConfig.enabled !== false,
+      };
+      wecomAccounts.set(targetAccountId, config);
+      return config;
+    }
+  }
+
+  // 2. 多账户支持：从 channels.wecom.accounts 读取
+  const accountConfig = cfg?.channels?.wecom?.accounts?.[targetAccountId];
+  if (accountConfig) {
+    const corpId = accountConfig.corpId;
+    const corpSecret = accountConfig.corpSecret;
+    const agentId = accountConfig.agentId;
+    const callbackToken = accountConfig.callbackToken;
+    const callbackAesKey = accountConfig.callbackAesKey;
+    const webhookPath = accountConfig.webhookPath || "/wecom/callback";
+
+    if (corpId && corpSecret && agentId) {
+      const config = {
+        accountId: targetAccountId,
+        corpId,
+        corpSecret,
+        agentId: asNumber(agentId),
+        callbackToken,
+        callbackAesKey,
+        webhookPath,
+        enabled: accountConfig.enabled !== false,
+      };
+      wecomAccounts.set(targetAccountId, config);
+      return config;
+    }
+  }
+
+  // 3. 回退到 env.vars（兼容旧配置）
+  const envVars = cfg?.env?.vars ?? {};
   const accountPrefix = targetAccountId === "default" ? "WECOM" : `WECOM_${targetAccountId.toUpperCase()}`;
 
   let corpId = envVars[`${accountPrefix}_CORP_ID`] || (targetAccountId === "default" ? envVars.WECOM_CORP_ID : null);
@@ -503,7 +582,7 @@ function getWecomConfig(api, accountId = null) {
   let callbackAesKey = envVars[`${accountPrefix}_CALLBACK_AES_KEY`] || (targetAccountId === "default" ? envVars.WECOM_CALLBACK_AES_KEY : null);
   let webhookPath = envVars[`${accountPrefix}_WEBHOOK_PATH`] || (targetAccountId === "default" ? envVars.WECOM_WEBHOOK_PATH : null) || "/wecom/callback";
 
-  // 回退到进程环境变量
+  // 4. 最后回退到进程环境变量
   if (!corpId) corpId = requireEnv(`${accountPrefix}_CORP_ID`) || requireEnv("WECOM_CORP_ID");
   if (!corpSecret) corpSecret = requireEnv(`${accountPrefix}_CORP_SECRET`) || requireEnv("WECOM_CORP_SECRET");
   if (!agentId) agentId = requireEnv(`${accountPrefix}_AGENT_ID`) || requireEnv("WECOM_AGENT_ID");
@@ -530,11 +609,18 @@ function getWecomConfig(api, accountId = null) {
 // 列出所有已配置的账户ID
 function listWecomAccountIds(api) {
   const cfg = api?.config ?? gatewayRuntime?.config;
-  const envVars = cfg?.env?.vars ?? {};
-
   const accountIds = new Set(["default"]);
 
-  // 查找 WECOM_<ACCOUNT>_CORP_ID 格式的配置
+  // 1. 从 channels.wecom.accounts 读取
+  const channelAccounts = cfg?.channels?.wecom?.accounts;
+  if (channelAccounts) {
+    for (const accountId of Object.keys(channelAccounts)) {
+      accountIds.add(accountId);
+    }
+  }
+
+  // 2. 从 env.vars 读取 (兼容旧配置)
+  const envVars = cfg?.env?.vars ?? {};
   for (const key of Object.keys(envVars)) {
     const match = key.match(/^WECOM_([A-Z0-9]+)_CORP_ID$/);
     if (match && match[1] !== "CORP") {
@@ -849,6 +935,12 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
       return;
     }
 
+    // 发送"正在处理"提示，缓解用户等待焦虑
+    await sendWecomTextSingle({
+      corpId, corpSecret, agentId, toUser: fromUser,
+      text: "⏳ 收到您的消息，正在处理中，请稍候..."
+    });
+
     api.logger.info?.(`wecom: calling agent for session ${sessionId}`);
 
     // 如果有图片，保存到临时文件供 AI 读取
@@ -895,6 +987,7 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
     let result;
     try {
       result = JSON.parse(stdout);
+      api.logger.info?.(`wecom: agent stdout length=${stdout.length}, parsed OK`);
     } catch (parseErr) {
       api.logger.warn?.(`wecom: failed to parse agent response as JSON: ${stdout.slice(0, 200)}`);
       // 如果不是 JSON，直接使用输出作为回复
@@ -905,6 +998,7 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
     // 格式: { result: { payloads: [{ text: "..." }] } }
     let replyText = "";
     if (result?.result?.payloads && Array.isArray(result.result.payloads)) {
+      api.logger.info?.(`wecom: found ${result.result.payloads.length} payloads`);
       replyText = result.result.payloads
         .map(p => p.text)
         .filter(Boolean)
@@ -918,14 +1012,17 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
     }
 
     if (replyText) {
+      api.logger.info?.(`wecom: raw replyText length=${replyText.length}`);
       // 应用 Markdown 转换
       const formattedReply = markdownToWecomText(replyText);
+      api.logger.info?.(`wecom: formatted reply length=${formattedReply.length}`);
       await sendWecomText({
         corpId,
         corpSecret,
         agentId,
         toUser: fromUser,
         text: formattedReply,
+        logger: api.logger,
       });
       api.logger.info?.(`wecom: sent AI reply to ${fromUser}: ${formattedReply.slice(0, 50)}...`);
     } else {
@@ -943,6 +1040,7 @@ async function processInboundMessage({ api, fromUser, content, msgType, mediaId,
         agentId,
         toUser: fromUser,
         text: `抱歉，处理您的消息时出现错误，请稍后重试。\n错误: ${err.message?.slice(0, 100) || "未知错误"}`,
+        logger: api.logger,
       });
     } catch (sendErr) {
       api.logger.error?.(`wecom: failed to send error message: ${sendErr.message}`);
