@@ -1,6 +1,6 @@
 {
   "name": "@mijia-life/clawdbot-wecom",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "WeCom (企业微信) channel plugin for Clawdbot (internal apps).",
