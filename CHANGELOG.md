@@ -1,0 +1,48 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [0.3.0] - 2026-01-28
+
+### Added
+
+#### 阶段一：核心稳定性
+- **Token 并发安全**：使用 Promise 锁防止多个请求同时刷新 access_token
+- **消息自动分段**：超过 2048 字符的消息自动在自然断点处分割发送
+- **XML 安全加固**：禁用实体处理防止 XXE 攻击，添加 1MB 请求体限制
+- **错误处理完善**：记录完整堆栈日志，二次发送失败不再吞没异常
+
+#### 阶段二：媒体功能
+- **图片上传**：新增 `uploadWecomMedia()` 函数上传临时素材
+- **图片发送**：新增 `sendWecomImage()` 函数发送图片消息
+- **图片 Vision**：下载用户图片保存到临时文件，AI 可读取分析
+- **deliverReply 媒体支持**：支持 `mediaUrl` 和 `mediaType` 参数
+
+#### 阶段三：用户体验
+- **命令系统**：支持 `/help`、`/status`、`/clear` 命令
+- **Markdown 转换**：AI 回复中的 Markdown 自动转换为可读纯文本格式
+- **API 限流**：RateLimiter 类限制并发（最多 3 个）和频率（200ms 间隔）
+
+#### 阶段四：高级功能
+- **多账户支持**：Token 缓存按账户隔离，支持 `WECOM_<ACCOUNT>_*` 格式配置
+- **语音转文字**：支持企业微信自带语音识别（Recognition 字段）
+- **群聊支持**：capabilities 支持 group 类型，群聊会话 ID 格式 `wecom:group:<chatId>`
+
+### Changed
+- `capabilities.media.outbound` 改为 `true`
+- `capabilities.markdown` 改为 `true`
+- `capabilities.chatTypes` 改为 `["direct", "group"]`
+- 插件版本升级至 0.3.0
+
+### Fixed
+- 修正 capabilities 声明与实际实现不符的问题
+- 修复长消息可能导致发送失败的问题
+
+## [0.1.0] - 2026-01-27
+
+### Added
+- 初始版本
+- 基础文本消息收发
+- 消息加解密和签名验证
+- access_token 缓存
+- 图片消息接收（仅传 URL）

@@ -4,16 +4,29 @@
 
 ## 功能特性
 
-- [x] 接收企业微信消息（文本、图片）
+### 核心功能
+- [x] 接收企业微信消息（文本、图片、语音）
 - [x] 自动调用 AI 代理处理消息
 - [x] 将 AI 回复发送回企业微信用户
 - [x] 消息签名验证和 AES 加密解密
 - [x] Webhook URL 验证（企业微信回调配置）
-- [x] access_token 自动缓存和刷新
-- [x] 图片消息识别和描述
-- [ ] 语音消息转文字（开发中）
-- [ ] 发送图片/文件消息（开发中）
-- [ ] Markdown 格式支持（开发中）
+- [x] access_token 自动缓存和刷新（支持多账户）
+
+### 媒体功能
+- [x] 图片消息接收和 AI 识别（Vision 能力）
+- [x] 图片消息发送
+- [x] 语音消息转文字（需开启企业微信语音识别）
+
+### 用户体验
+- [x] 命令系统（/help、/status、/clear）
+- [x] Markdown 格式自动转换
+- [x] 长消息自动分段（2048 字符限制）
+- [x] API 限流保护
+
+### 高级功能
+- [x] 多账户支持
+- [x] 群聊支持
+- [x] Token 并发安全
 
 ## 前置要求
 
@@ -28,7 +41,7 @@
 1. 克隆本仓库：
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/clawdbot-wecom.git
+git clone https://github.com/anthropics/clawdbot-wecom.git
 cd clawdbot-wecom
 npm install
 ```
@@ -43,6 +56,11 @@ npm install
       "paths": [
         "/path/to/clawdbot-wecom"
       ]
+    },
+    "entries": {
+      "clawdbot-wecom": {
+        "enabled": true
+      }
     }
   }
 }
@@ -98,7 +116,29 @@ clawdbot plugins install @mijia-life/clawdbot-wecom
 }
 ```
 
-或者使用 `.env` 文件（参考 `.env.example`）。
+#### 多账户配置
+
+支持配置多个企业微信账户，使用 `WECOM_<ACCOUNT>_*` 格式：
+
+```json
+{
+  "env": {
+    "vars": {
+      "WECOM_CORP_ID": "默认账户企业ID",
+      "WECOM_CORP_SECRET": "默认账户Secret",
+      "WECOM_AGENT_ID": "默认账户AgentId",
+      "WECOM_CALLBACK_TOKEN": "默认账户Token",
+      "WECOM_CALLBACK_AES_KEY": "默认账户AESKey",
+
+      "WECOM_SALES_CORP_ID": "销售账户企业ID",
+      "WECOM_SALES_CORP_SECRET": "销售账户Secret",
+      "WECOM_SALES_AGENT_ID": "销售账户AgentId",
+      "WECOM_SALES_CALLBACK_TOKEN": "销售账户Token",
+      "WECOM_SALES_CALLBACK_AES_KEY": "销售账户AESKey"
+    }
+  }
+}
+```
 
 ### 第五步：配置公网访问
 
@@ -114,17 +154,6 @@ cloudflared tunnel create clawdbot
 # 配置隧道路由
 cloudflared tunnel route dns clawdbot 你的域名
 
-# 创建配置文件 /etc/cloudflared/config.yml
-tunnel: YOUR_TUNNEL_ID
-credentials-file: ~/.cloudflared/YOUR_TUNNEL_ID.json
-protocol: http2
-
-ingress:
-  - hostname: 你的域名
-    path: /wecom/callback
-    service: http://127.0.0.1:8885
-  - service: http_status:404
-
 # 启动隧道
 cloudflared tunnel run clawdbot
 ```
@@ -134,7 +163,7 @@ cloudflared tunnel run clawdbot
 1. 重启 Clawdbot Gateway：
 
 ```bash
-launchctl kickstart -k gui/501/com.clawdbot.gateway
+clawdbot gateway restart
 ```
 
 2. 检查插件是否加载：
@@ -151,16 +180,24 @@ clawdbot plugins list
 配置完成后，企业微信用户可以直接向应用发送消息：
 
 1. 在企业微信中找到你创建的应用
-2. 发送文字或图片消息
+2. 发送文字、图片或语音消息
 3. AI 会自动回复
+
+### 命令系统
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示帮助信息 |
+| `/status` | 查看系统状态（含账户信息） |
+| `/clear` | 清除会话历史 |
 
 ### 支持的消息类型
 
 | 类型 | 接收 | 发送 | 说明 |
 |------|------|------|------|
-| 文本 | ✅ | ✅ | 完全支持 |
-| 图片 | ✅ | ❌ | 接收后由 AI 识别描述 |
-| 语音 | ⚠️ | ❌ | 接收但暂不处理 |
+| 文本 | ✅ | ✅ | 完全支持，自动分段 |
+| 图片 | ✅ | ✅ | 支持 Vision 识别 |
+| 语音 | ✅ | ❌ | 需开启企业微信语音识别 |
 | 视频 | ❌ | ❌ | 暂不支持 |
 | 文件 | ❌ | ❌ | 暂不支持 |
 
@@ -189,7 +226,7 @@ curl https://你的域名/wecom/callback
 
 3. 查看 Clawdbot 日志：
 ```bash
-clawdbot logs -f
+clawdbot logs -f | grep wecom
 ```
 
 ### 消息没有回复
@@ -204,25 +241,18 @@ clawdbot logs -f
 2. 检查应用的可见范围是否包含测试用户
 3. 确认服务器能访问 `qyapi.weixin.qq.com`
 
-## 开发
-
-```bash
-# 安装依赖
-npm install
-
-# 查看日志
-clawdbot logs -f | grep wecom
-
-# 重启网关（修改代码后）
-launchctl kickstart -k gui/501/com.clawdbot.gateway
-```
-
 ## 技术实现
 
 - **消息加解密**：使用 AES-256-CBC 算法，遵循企业微信加密规范
 - **签名验证**：SHA1 签名验证，防止消息伪造
 - **异步处理**：消息接收后立即返回 200，异步调用 AI 处理
-- **Token 缓存**：access_token 自动缓存，过期前 1 分钟刷新
+- **Token 缓存**：access_token 按账户隔离缓存，过期前 1 分钟刷新
+- **并发安全**：Promise 锁防止重复刷新 token
+- **API 限流**：RateLimiter 控制并发和频率
+
+## 版本历史
+
+查看 [CHANGELOG.md](./CHANGELOG.md) 了解完整版本历史。
 
 ## 相关链接
 
