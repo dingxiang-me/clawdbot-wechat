@@ -273,3 +273,38 @@ MIT
 ## 致谢
 
 本插件由 [Clawdbot](https://clawd.bot) 社区开发维护。
+
+
+## 部署与公网接入
+
+详见：docs/DEPLOYMENT.md
+
+## Troubleshooting（常见问题）
+
+### 1) 回调 URL 校验失败 / cloudflared funnel 公共域名不可用
+
+现象：企业微信后台「设置API接收」校验 URL 失败，或用 cloudflared funnel/trycloudflare 之类公共临时域名不稳定。
+
+建议：**不要用 funnel 公共域名**，改用 **Cloudflare Tunnel + 你自己的域名（非 funnel）**。
+
+最小流程：
+- 绑定域名到 Cloudflare
+- `cloudflared tunnel create clawdbot`
+- `cloudflared tunnel route dns clawdbot <your-domain>`
+- 回调 URL 填：`https://<your-domain>/wecom/callback`
+
+> 备案说明：若部署在中国大陆机房/云，通常需要 ICP 备案；若部署在境外，一般不需要 ICP（但访问质量取决于网络）。
+
+### 2) 收不到消息 / 收到但不回复
+
+自查顺序：
+1. 企业微信后台：应用可见范围、接收消息开关、回调 URL 是否已保存成功
+2. 服务器是否可被公网访问（HTTPS 可用，路径正确）
+3. Clawdbot 配置是否加载了本插件（plugins.paths 或 plugins install）
+4. 环境变量是否齐全：`WECOM_CORP_ID/WECOM_CORP_SECRET/WECOM_AGENT_ID/WECOM_CALLBACK_TOKEN/WECOM_CALLBACK_AES_KEY`
+5. 查看 Clawdbot 日志里是否有 `wecom: registered webhook` / `wecom inbound:` 记录
+
+### 3) 文本太长被截断
+
+企业微信文本有长度限制（约 2048 字节）。本插件已做自动分段；如仍异常，请贴出日志里 split 信息。
+
