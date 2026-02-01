@@ -31,6 +31,7 @@
   },
   "scripts": {
     "lint": "node -c src/index.js",
-    "test": "node -e \"console.log(\"no tests yet\")\""
+    "test": "node -e \"console.log(\"no tests yet\")\"",
+    "wecom:selfcheck": "node scripts/wecom-selfcheck.mjs"
   }
 }
