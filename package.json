@@ -31,7 +31,24 @@
   },
   "scripts": {
     "lint": "node -c src/index.js",
-    "test": "node -e \"console.log(\"no tests yet\")\"",
+    "test": "vitest run",
     "wecom:selfcheck": "node scripts/wecom-selfcheck.mjs"
+  },
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dingxiang-me/OpenClaw-Wechat.git"
+  },
+  "keywords": [],
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/dingxiang-me/OpenClaw-Wechat/issues"
+  },
+  "homepage": "https://github.com/dingxiang-me/OpenClaw-Wechat#readme",
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }
